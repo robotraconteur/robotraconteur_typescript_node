@@ -80,11 +80,11 @@ const webSocketLookup = ((hostname: string, options: LookupOptions, callback: (e
     else callback(null, addresses[0]!.address, addresses[0]!.family);
 }) as LookupFunction;
 
-async function openWebSocket(url: string, timeout: number, options: WebSocketClientOptions, events: SocketEvents): Promise<SocketAdapter>
+async function openWebSocket(url: string, timeout: number, max_payload: number, options: WebSocketClientOptions, events: SocketEvents): Promise<SocketAdapter>
 {
     // Loaded only when needed, so that rr+tcp works without it
     const { WebSocket } = await import("ws");
-    const ws = new WebSocket(url, WEBSOCKET_PROTOCOL, { lookup: webSocketLookup, ...options, handshakeTimeout: timeout, perMessageDeflate: false });
+    const ws = new WebSocket(url, WEBSOCKET_PROTOCOL, { lookup: webSocketLookup, ...options, maxPayload: max_payload, handshakeTimeout: timeout, perMessageDeflate: false });
     await new Promise<void>((resolve, reject) =>
     {
         const on_error = (err: Error) =>
@@ -308,7 +308,6 @@ function openSocket(host: string, port: number, timeout: number): Promise<Socket
     });
 }
 
-/** A link-local address without a scope may be reachable through any interface, so all are tried */
 /**
  * The addresses to try for a host. Like Core, a name is resolved and every address is tried, since
  * a server may listen on only one of the addresses a name resolves to, such as 127.0.0.1 for localhost.
@@ -336,6 +335,7 @@ async function candidateHosts(url_host: string): Promise<string[]>
     }
     if (!isIPv6(host) || !isIPv6LinkLocal(host) || host.includes("%")) return [host];
 
+    // A link-local address without a scope may be reachable through any interface, so all are tried
     const scopes = new Set<string>();
     for (const [name, addresses] of Object.entries(networkInterfaces()))
     {
@@ -434,7 +434,7 @@ export class TcpTransport implements Transport, TcpServerParent
             if (websocket)
             {
                 const ws_url = url.replace(u.scheme + "://", (u.scheme === "rr+wss" ? "wss" : "ws") + "://");
-                return openWebSocket(ws_url, this.defaultConnectTimeout, this.webSocketOptions, events);
+                return openWebSocket(ws_url, this.defaultConnectTimeout, this.maxMessageSize, this.webSocketOptions, events);
             }
             const socket = await connectAny(await candidateHosts(u.host), u.port, this.defaultConnectTimeout);
             const listeners = { data: (data: Buffer) => events.onData(data), close: () => events.onClose() };
@@ -549,7 +549,16 @@ export class TcpTransport implements Transport, TcpServerParent
         let path = "/";
         if (url !== "")
         {
-            const u = new URL(url);
+            let u: URL;
+            try
+            {
+                u = new URL(url);
+            }
+            catch
+            {
+                ws.terminate();
+                throw new RobotRaconteurError(MessageErrorType.InvalidArgument, "RobotRaconteur.InvalidArgument", `Invalid WebSocket URL: ${url}`);
+            }
             scheme = /^(wss|https|rr\+wss):$/.test(u.protocol) ? "rr+wss" : "rr+ws";
             host = u.host;
             path = u.pathname;

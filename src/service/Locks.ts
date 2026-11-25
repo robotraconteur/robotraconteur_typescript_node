@@ -81,6 +81,8 @@ interface MonitorEntry
 export class Monitor
 {
     private holder: MonitorEntry | null = null;
+    /** True while RobotRaconteurMonitorExit of the last holder runs; the next client waits for it */
+    private exiting = false;
     private entries = new Map<number, MonitorEntry>();
     private queue: MonitorEntry[] = [];
 
@@ -186,7 +188,7 @@ export class Monitor
     /** Give the lock to the next waiting client */
     private async grant(): Promise<void>
     {
-        if (this.holder) return;
+        if (this.holder || this.exiting) return;
         const e = this.queue.shift();
         if (!e) return;
         this.holder = e;
@@ -194,6 +196,12 @@ export class Monitor
         {
             const obj = this.skel.obj;
             if (typeof obj.RobotRaconteurMonitorEnter === "function") await obj.RobotRaconteurMonitorEnter(e.timeout);
+            if (e.error)
+            {
+                // The client stopped waiting while the object was entering its monitor
+                void this.release(e);
+                return;
+            }
             e.acquired = true;
             this.refresh(e);
         }
@@ -211,6 +219,7 @@ export class Monitor
         if (this.holder !== e) return;
         this.drop(e);
         this.holder = null;
+        this.exiting = true;
         try
         {
             const obj = this.skel.obj;
@@ -219,6 +228,10 @@ export class Monitor
         catch (err)
         {
             console.error("Error in RobotRaconteurMonitorExit:", err);
+        }
+        finally
+        {
+            this.exiting = false;
         }
         void this.grant();
     }

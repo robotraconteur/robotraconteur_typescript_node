@@ -58,7 +58,9 @@ function hostFamilyMatches(host: string, sender: string): boolean
 {
     const family = isIP(host);
     if (family === 0) return false;
-    if (isLoopback(host)) return true;
+    // A loopback URL is only accepted from a loopback sender, otherwise a LAN host could make
+    // subscribers connect to their own loopback ports
+    if (isLoopback(host)) return isLoopback(sender);
     if (family !== isIP(sender)) return false;
     if (family === 6) return isIPv6LinkLocal(host) || isIPv6SiteLocal(host);
     const a = host.split(".");
@@ -80,6 +82,8 @@ export function parseNodeAnnouncement(packet: string, sender: string): NodeAnnou
     try
     {
         const nodeID = new NodeID(id_line[0]!);
+        // The all-zero NodeID means any node. Core ignores it
+        if (nodeID.isAnyNode) return null;
         const u = parseConnectionUrl(url);
         if (!u.nodeid.equals(nodeID)) return null;
 
@@ -89,8 +93,12 @@ export function parseNodeAnnouncement(packet: string, sender: string): NodeAnnou
         let serviceStateNonce = "";
         for (const line of lines.slice(3))
         {
-            const m = /^\s*([\w+.-]+)\s*:\s*(.*?)\s*$/.exec(line);
-            if (m && m[1] === "ServiceStateNonce" && m[2]!.length < 32) serviceStateNonce = m[2]!;
+            // "key: value", split on the first ':' and trimmed. A regex with a lazy value and trailing
+            // whitespace here took quadratic time on long lines of spaces
+            const i = line.indexOf(":");
+            if (i < 0 || line.slice(0, i).trim() !== "ServiceStateNonce") continue;
+            const value = line.slice(i + 1).trim();
+            if (value.length <= 32 && !/[\r\u2028\u2029]/.test(value)) serviceStateNonce = value;
         }
 
         const name = id_line[1] ?? "";

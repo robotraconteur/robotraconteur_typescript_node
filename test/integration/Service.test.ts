@@ -18,9 +18,11 @@ import { connect as netConnect } from "node:net";
 import { join } from "node:path";
 import { after, before, describe, test } from "node:test";
 import { promisify } from "node:util";
-import { GeneratorHandle, NamedArrayView, newNamedArrayView, RobotRaconteurError, RobotRaconteurNode, VarValue } from "robotraconteur";
+import { GeneratorHandle, NamedArrayView, newNamedArrayView, NodeID, NodeID as RRNodeID, RobotRaconteurError, RobotRaconteurNode, VarValue } from "robotraconteur";
+import { DataTypes, deserializeMessage, Message, MessageElement, MessageEntry, MessageEntryType, MessageErrorType, serializeMessage, TransportCapabilityCode } from "robotraconteur/internal";
 import type { Endpoint, ITransportConnection, ServiceStub } from "robotraconteur";
-import { isWebSocketOriginAllowed, TcpTransport } from "../../src/index.js";
+import * as rri from "robotraconteur/internal";
+import { DEFAULT_WEBSOCKET_ALLOWED_ORIGINS, isWebSocketOriginAllowed, PasswordFileUserAuthenticator, ServiceSecurityPolicy, TcpTransport } from "../../src/index.js";
 import type { ServerContext } from "../../src/index.js";
 import { TEST_SERVICE_DEF, TestRoot } from "./TestService.js";
 import { PYTHON, root } from "./TestServer.js";
@@ -118,7 +120,7 @@ describe("services", () =>
                 assert.equal(await c.callFunction("add", [2, 3]), 5);
                 assert.equal(await c.callFunction("add", { b: 10, a: 1 }), 11);
                 assert.equal(await c.callFunction("add_slowly", [1, 1]), 2);
-                assert.equal(await c.callFunction("set_s1", ["changed"]), undefined);
+                assert.equal(await c.callFunction("change_s1", ["changed"]), undefined);
                 assert.equal(obj.s1, "changed");
                 assert.deepEqual({ ...(await c.callFunction("make_point", [5, 6]) as object) }, { x: 5, y: 6 });
             });
@@ -193,7 +195,7 @@ describe("services", () =>
                 const named = (name: string) => (e: RobotRaconteurError) => e.errorName === "RobotRaconteur." + name;
                 await c.callFunction("reset_wires");
                 await assert.rejects(c.peekWireInValue("w"), named("ValueNotSet"));
-                await c.callFunction("set_w", [2.5]);
+                await c.callFunction("change_w", [2.5]);
                 assert.equal((await c.peekWireInValue("w")).value, 2.5);
                 await assert.rejects(c.pokeWireOutValue("w", 1), named("ReadOnlyMember"));
 
@@ -202,19 +204,19 @@ describe("services", () =>
                 assert.ok(await c.waitWireInValueValid(w, 5000));
                 assert.equal(c.getWireInValue(w).value, 2.5);
                 const next = new Promise<unknown>((resolve) => c.addWireValueChangedListener(w, (_h, v) => resolve(v)));
-                await c.callFunction("set_w", [3.5]);
+                await c.callFunction("change_w", [3.5]);
                 assert.equal(await next, 3.5);
                 await c.closeWire(w);
 
-                await assert.rejects(c.callFunction("get_wpoke"), named("ValueNotSet"));
+                await assert.rejects(c.callFunction("read_wpoke"), named("ValueNotSet"));
                 await assert.rejects(c.peekWireInValue("wpoke"), named("WriteOnlyMember"));
                 await c.pokeWireOutValue("wpoke", 4);
-                assert.equal(await c.callFunction("get_wpoke"), 4);
+                assert.equal(await c.callFunction("read_wpoke"), 4);
                 assert.equal((await c.peekWireOutValue("wpoke")).value, 4);
                 const wp = await c.connectWire("wpoke");
                 c.setWireOutValue(wp, 5);
                 await new Promise((r) => setTimeout(r, 200));
-                assert.equal(await c.callFunction("get_wpoke"), 5);
+                assert.equal(await c.callFunction("read_wpoke"), 5);
                 await c.closeWire(wp);
             });
 
@@ -362,6 +364,198 @@ describe("services", () =>
         }
     });
 
+    test("events are not sent to clients that have not logged in to a service that requires one", async () =>
+    {
+        // A client that connects in separate requests is connected before it logs in, as in Core
+        // ServerContext::SendEvent, which skips clients without an authenticated user
+        class SeparateTcpTransport extends TcpTransport
+        {
+            override async createTransportConnection(u: string, endpoint: Endpoint): Promise<ITransportConnection>
+            {
+                const c = await super.createTransportConnection(u, endpoint);
+                (c as { useCombinedConnection: boolean }).useCombinedConnection = false;
+                return c;
+            }
+        }
+        const auth_obj = new TestRoot();
+        const users = `user1 ${PasswordFileUserAuthenticator.md5Hash("pass1")} _`;
+        const auth_context = server.registerService("test_auth", "experimental.ts_service_test.testroot", auth_obj,
+            new ServiceSecurityPolicy(new PasswordFileUserAuthenticator(users), { requirevaliduser: "true" }));
+        const n = new RobotRaconteurNode();
+        n.registerTransport(new SeparateTcpTransport(n));
+        try
+        {
+            const anon = await n.connectService(url("rr+tcp", "test_auth"));
+            const user = await client.connectService(url("rr+tcp", "test_auth"), "user1", { password: new VarValue("pass1", "string") });
+            assert.equal(auth_context.clientEndpoints.length, 2);
+            const anon_events: unknown[][] = [];
+            anon.addEventListener("ev1", (...args: unknown[]) => anon_events.push(args));
+            const received = new Promise<unknown[]>((resolve) => user.addEventListener("ev1", (...args: unknown[]) => resolve(args)));
+            auth_obj.ev1.fire("secret", 1);
+            assert.deepEqual(await received, ["secret", 1]);
+            await new Promise((r) => setTimeout(r, 200));
+            assert.deepEqual(anon_events, []);
+            await client.disconnectService(user);
+        }
+        finally
+        {
+            await n.shutdown();
+            server.closeService("test_auth");
+        }
+    });
+
+    test("a client lock is released when its client disconnects after logging out", async () =>
+    {
+        // As Core: client locks are released by endpoint, not by the endpoint's current user
+        const users = `user1 ${PasswordFileUserAuthenticator.md5Hash("pass1")} objectlock`;
+        const lock_context = server.registerService("test_lock_logout", "experimental.ts_service_test.testroot", new TestRoot(),
+            new ServiceSecurityPolicy(new PasswordFileUserAuthenticator(users), { requirevaliduser: "true", allowobjectlock: "true" }));
+        try
+        {
+            const c = await client.connectService(url("rr+tcp", "test_lock_logout"), "user1", { password: new VarValue("pass1", "string") });
+            const o1 = await c.getObjRef("o1");
+            await client.requestObjectLock(o1, "client");
+            assert.equal(await lock_context.getObjectLockUsername("test_lock_logout.o1"), "user1");
+            lock_context.getClient(c.context.remoteEndpoint)!.logoutUser();
+            await client.disconnectService(c);
+            assert.equal(await lock_context.getObjectLockUsername("test_lock_logout.o1"), "");
+        }
+        finally
+        {
+            server.closeService("test_lock_logout");
+        }
+    });
+
+    test("another client of the same user cannot release a client lock", async () =>
+    {
+        const users = `user1 ${PasswordFileUserAuthenticator.md5Hash("pass1")} objectlock`;
+        const lock_context = server.registerService("test_lock_session", "experimental.ts_service_test.testroot", new TestRoot(),
+            new ServiceSecurityPolicy(new PasswordFileUserAuthenticator(users), { requirevaliduser: "true", allowobjectlock: "true" }));
+        const n = newClientNode();
+        try
+        {
+            const credentials = { password: new VarValue("pass1", "string") };
+            const c1 = await client.connectService(url("rr+tcp", "test_lock_session"), "user1", credentials);
+            const c2 = await n.connectService(url("rr+tcp", "test_lock_session"), "user1", credentials);
+            const o1 = await c1.getObjRef("o1");
+            const o1_2 = await c2.getObjRef("o1");
+            await client.requestObjectLock(o1, "client");
+            await assert.rejects(n.releaseObjectLock(o1_2), (e: RobotRaconteurError) => e.errorName === "RobotRaconteur.ObjectLockedError");
+            assert.equal(await lock_context.getObjectLockUsername("test_lock_session.o1"), "user1");
+            await client.releaseObjectLock(o1);
+            assert.equal(await lock_context.getObjectLockUsername("test_lock_session.o1"), "");
+            await client.disconnectService(c1);
+        }
+        finally
+        {
+            await n.shutdown();
+            server.closeService("test_lock_session");
+        }
+    });
+
+    test("clients that have not logged in cannot monitor-lock objects of a service that requires a user", async () =>
+    {
+        // A client that connects in separate requests is connected before it logs in
+        class SeparateTcpTransport extends TcpTransport
+        {
+            override async createTransportConnection(u: string, endpoint: Endpoint): Promise<ITransportConnection>
+            {
+                const c = await super.createTransportConnection(u, endpoint);
+                (c as { useCombinedConnection: boolean }).useCombinedConnection = false;
+                return c;
+            }
+        }
+        const users = `user1 ${PasswordFileUserAuthenticator.md5Hash("pass1")} _`;
+        server.registerService("test_monitor_auth", "experimental.ts_service_test.testroot", new TestRoot(),
+            new ServiceSecurityPolicy(new PasswordFileUserAuthenticator(users), { requirevaliduser: "true" }));
+        const n = new RobotRaconteurNode();
+        n.registerTransport(new SeparateTcpTransport(n));
+        try
+        {
+            const anon = await n.connectService(url("rr+tcp", "test_monitor_auth"));
+            await assert.rejects(n.monitorEnter(anon, 1000), (e: RobotRaconteurError) => e.errorName === "RobotRaconteur.PermissionDenied");
+            const user = await client.connectService(url("rr+tcp", "test_monitor_auth"), "user1", { password: new VarValue("pass1", "string") });
+            await client.monitorEnter(user, 1000);
+            await client.monitorExit(user);
+            await client.disconnectService(user);
+        }
+        finally
+        {
+            await n.shutdown();
+            server.closeService("test_monitor_auth");
+        }
+    });
+
+    test("objects can be locked only if the allowobjectlock policy is set", async () =>
+    {
+        const users = `user1 ${PasswordFileUserAuthenticator.md5Hash("pass1")} objectlock`;
+        const credentials = { password: new VarValue("pass1", "string") };
+        for (const allow of [false, true])
+        {
+            const name = allow ? "test_lock_allowed" : "test_lock_not_allowed";
+            server.registerService(name, "experimental.ts_service_test.testroot", new TestRoot(),
+                new ServiceSecurityPolicy(new PasswordFileUserAuthenticator(users), allow ? { requirevaliduser: "true", allowobjectlock: "true" } : { requirevaliduser: "true" }));
+            try
+            {
+                const c = await client.connectService(url("rr+tcp", name), "user1", credentials);
+                const o1 = await c.getObjRef("o1");
+                if (allow)
+                {
+                    await client.requestObjectLock(o1, "client");
+                    await client.releaseObjectLock(o1);
+                }
+                else
+                {
+                    for (const flags of ["user", "client"] as const)
+                    {
+                        await assert.rejects(client.requestObjectLock(o1, flags), (e: RobotRaconteurError) => e.errorName === "RobotRaconteur.PermissionDenied");
+                    }
+                }
+                await client.disconnectService(c);
+            }
+            finally
+            {
+                server.closeService(name);
+            }
+        }
+    });
+
+    test("a generator the client did not close is aborted when it is destroyed", async () =>
+    {
+        let finish = () => {};
+        const finished = new Promise<void>((resolve) => (finish = resolve));
+        class GenRoot extends TestRoot
+        {
+            override async *count_to(n: number): AsyncGenerator<number>
+            {
+                try
+                {
+                    for (let i = 0; i < n; i++) yield i;
+                }
+                finally
+                {
+                    finish();
+                }
+            }
+        }
+        const gen_context = server.registerService("test_gen_drop", "experimental.ts_service_test.testroot", new GenRoot());
+        try
+        {
+            const c = await client.connectService(url("rr+tcp", "test_gen_drop"));
+            const g = await c.callGenerator<number>("count_to", [5]);
+            assert.equal(await c.callFunctionGenNext(g), 0);
+            // The generator expires without the client closing it
+            (await gen_context.getObjectSkel("test_gen_drop")).cleanupGenerators(Date.now() + 3600000);
+            const ran = await Promise.race([finished.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 5000))]);
+            assert.ok(ran, "the generator's finally block ran");
+            await client.disconnectService(c);
+        }
+        finally
+        {
+            server.closeService("test_gen_drop");
+        }
+    });
+
     test("disconnecting removes the client", async () =>
     {
         const c = await client.connectService(url());
@@ -369,6 +563,35 @@ describe("services", () =>
         assert.ok(context.clientEndpoints.includes(ep));
         await client.disconnectService(c);
         assert.ok(!context.clientEndpoints.includes(ep));
+    });
+
+    test("a connection cannot disconnect a client that uses another connection", async () =>
+    {
+        const n = newClientNode();
+        try
+        {
+            const c1 = await client.connectService(url());
+            const c2 = await n.connectService(url());
+            const m = new Message();
+            m.header.senderNodeID = n.nodeID;
+            m.header.receiverNodeID = server.nodeID;
+            m.header.senderEndpoint = c2.context.localEndpoint;
+            m.header.receiverEndpoint = c1.context.remoteEndpoint;
+            const e = new MessageEntry(MessageEntryType.DisconnectClient, "");
+            e.requestID = 1000;
+            e.addElement(MessageElement.string("servicename", "test"));
+            m.entries.push(e);
+            c2.context.transportConnection!.sendMessage(m);
+            // Requests on one connection are served in order, so the DisconnectClient has been handled
+            assert.equal(await c2.callFunction("add", [1, 2]), 3);
+            assert.ok(context.clientEndpoints.includes(c1.context.remoteEndpoint));
+            assert.equal(await c1.callFunction("add", [2, 3]), 5);
+            await client.disconnectService(c1);
+        }
+        finally
+        {
+            await n.shutdown();
+        }
     });
 
     test("a client cannot connect to a service that does not exist", async () =>
@@ -413,6 +636,33 @@ describe("services", () =>
         }
     });
 
+    test("default WebSocket origins allow local files but not every extension or plain http", async () =>
+    {
+        for (const o of ["chrome-extension://abcdef", "http://robotraconteur.com", "http://www.robotraconteur.com:80"])
+        {
+            assert.ok(!isWebSocketOriginAllowed(o, DEFAULT_WEBSOCKET_ALLOWED_ORIGINS), o);
+        }
+        for (const o of ["null", "file://", "https://robotraconteur.com", "https://www.robotraconteur.com:443"])
+        {
+            assert.ok(isWebSocketOriginAllowed(o, DEFAULT_WEBSOCKET_ALLOWED_ORIGINS), o);
+        }
+
+        // A page loaded from a local file (Origin: null) connects to the test service with the defaults
+        const n = new RobotRaconteurNode();
+        const t = new TcpTransport(n);
+        n.registerTransport(t);
+        try
+        {
+            t.webSocketOptions = { headers: { Origin: "null" } };
+            const c = await n.connectService(url("rr+ws"));
+            assert.equal(await c.callFunction("add", [1, 2]), 3);
+        }
+        finally
+        {
+            await n.shutdown();
+        }
+    });
+
     test("a socket that does not start a known protocol is closed", async () =>
     {
         const result = (data: string | null) => new Promise<string>((resolve) =>
@@ -427,6 +677,299 @@ describe("services", () =>
         assert.match(await result("HELLO"), /404/);
         // Nothing sent at all, so the handshake times out
         assert.equal(await result(null), "");
+    });
+
+    test("a second CreateConnection cannot change the NodeID of a connection", async () =>
+    {
+        // As in Core, the NodeID is only set while it is Any or unchanged
+        const s = netConnect(tcp.listenPort, "127.0.0.1");
+        s.on("error", () => undefined);
+        await new Promise((r) => s.once("connect", r));
+        const replies: Message[] = [];
+        let pending = Buffer.alloc(0);
+        let wake = () => {};
+        s.on("data", (d: Buffer) =>
+        {
+            pending = Buffer.concat([pending, d]);
+            while (pending.length >= 8 && pending.length >= pending.readUInt32LE(4))
+            {
+                const n = pending.readUInt32LE(4);
+                replies.push(deserializeMessage(new Uint8Array(pending.subarray(0, n))));
+                pending = pending.subarray(n);
+            }
+            wake();
+        });
+        const createConnection = async (id: NodeID) =>
+        {
+            const m = new Message();
+            m.header.senderNodeID = id;
+            const e = new MessageEntry(MessageEntryType.StreamOp, "CreateConnection");
+            e.addElement(new MessageElement("capabilities", DataTypes.uint32_t, Uint32Array.of((TransportCapabilityCode.Message2BasicPage | TransportCapabilityCode.Message2BasicEnable) >>> 0)));
+            m.entries.push(e);
+            s.write(serializeMessage(m));
+            while (replies.length === 0) await new Promise<void>((r) => (wake = r));
+            return replies.shift()!.entries[0]!.error;
+        };
+        try
+        {
+            const id = NodeID.newUniqueID();
+            assert.equal(await createConnection(id), MessageErrorType.None);
+            assert.equal(await createConnection(id), MessageErrorType.None);
+            assert.equal(await createConnection(NodeID.newUniqueID()), MessageErrorType.NodeNotFound);
+        }
+        finally
+        {
+            s.destroy();
+        }
+    });
+
+    test("CreateConnection without a Message Version 2 capability page is accepted, as in Core", async () =>
+    {
+        // Core assumes Message Version 2 unless the client sends a page for it
+        const s = netConnect(tcp.listenPort, "127.0.0.1");
+        s.on("error", () => undefined);
+        await new Promise((r) => s.once("connect", r));
+        let pending = Buffer.alloc(0);
+        const reply = new Promise<Message>((resolve) => s.on("data", (d: Buffer) =>
+        {
+            pending = Buffer.concat([pending, d]);
+            if (pending.length >= 8 && pending.length >= pending.readUInt32LE(4)) resolve(deserializeMessage(new Uint8Array(pending.subarray(0, pending.readUInt32LE(4)))));
+        }));
+        try
+        {
+            const m = new Message();
+            m.header.senderNodeID = NodeID.newUniqueID();
+            const e = new MessageEntry(MessageEntryType.StreamOp, "CreateConnection");
+            e.addElement(new MessageElement("capabilities", DataTypes.uint32_t, Uint32Array.of((TransportCapabilityCode.Message4BasicPage | TransportCapabilityCode.Message4BasicEnable) >>> 0)));
+            m.entries.push(e);
+            s.write(serializeMessage(m));
+            const r = (await reply).entries[0]!;
+            assert.equal(r.error, MessageErrorType.None);
+            assert.deepEqual(r.elements.find((x) => x.elementName === "capabilities")?.data, Uint32Array.of((TransportCapabilityCode.Message2BasicPage | TransportCapabilityCode.Message2BasicEnable) >>> 0));
+        }
+        finally
+        {
+            s.destroy();
+        }
+    });
+
+    test("a connection cannot send requests to the endpoint of a client on another connection", async () =>
+    {
+        const n1 = newClientNode();
+        const n2 = newClientNode();
+        try
+        {
+            const c1 = await n1.connectService(url());
+            const c2 = await n2.connectService(url());
+            await c1.callFunction("change_s1", ["mine"]);
+            const closed = new Promise<void>((resolve) => c2.context.addCloseListener(resolve));
+
+            // Over its own connection, the second client addresses the first client's service endpoint
+            const m = new Message();
+            m.header.senderNodeID = n2.nodeID;
+            m.header.receiverNodeID = server.nodeID;
+            m.header.senderEndpoint = c2.context.localEndpoint;
+            m.header.receiverEndpoint = c1.context.remoteEndpoint;
+            const e = new MessageEntry(MessageEntryType.FunctionCallReq, "change_s1");
+            e.servicePath = "test";
+            e.requestID = 1000;
+            e.addElement(MessageElement.string("s", "forged"));
+            m.entries.push(e);
+            c2.context.transportConnection!.sendMessage(m);
+
+            // The request is refused with InvalidEndpoint, which closes the second client
+            const was_closed = await Promise.race([closed.then(() => true), new Promise<boolean>((r) => setTimeout(() => r(false), 5000))]);
+            assert.equal(await c1.callFunction("add", [1, 2]), 3);
+            assert.equal(obj.s1, "mine");
+            assert.ok(was_closed);
+        }
+        finally
+        {
+            await n1.shutdown();
+            await n2.shutdown();
+        }
+    });
+
+    test("every spelling of an objref index gives the one object at the canonical path", async () =>
+    {
+        // As Core's encode_index: obj[1] and obj[%31] must not be two skels (two locks) for one object
+        const c = await client.connectService(url());
+        try
+        {
+            assert.equal(await (await c.context.findObjRef("test.o2[1]")).callFunction("path"), "test.o2[1]");
+            assert.equal(await (await c.context.findObjRef("test.o2[%31]")).callFunction("path"), "test.o2[1]");
+            assert.equal(await (await c.context.findObjRef("test.o3[a%2Eb]")).callFunction("path"), "test.o3[a%2eb]");
+        }
+        finally
+        {
+            await client.disconnectService(c);
+        }
+    });
+
+    test("a special request with more than one entry closes the connection", async () =>
+    {
+        // Object protocol, "Special Requests": a special request must be the only entry in its message. Each
+        // entry used to be answered, so one message could make the service build a reply of entries x
+        // definition size
+        const run = async (count: number) =>
+        {
+            const s = netConnect(tcp.listenPort, "127.0.0.1");
+            s.on("error", () => undefined);
+            await new Promise((r) => s.once("connect", r));
+            const replies: rri.Message[] = [];
+            let closed = false;
+            let pending = Buffer.alloc(0);
+            let wake = () => {};
+            s.on("data", (d: Buffer) =>
+            {
+                pending = Buffer.concat([pending, d]);
+                while (pending.length >= 8 && pending.length >= pending.readUInt32LE(4))
+                {
+                    const n = pending.readUInt32LE(4);
+                    replies.push(rri.deserializeMessage(new Uint8Array(pending.subarray(0, n))));
+                    pending = pending.subarray(n);
+                }
+                wake();
+            });
+            s.on("close", () =>
+            {
+                closed = true;
+                wake();
+            });
+            const next = async () =>
+            {
+                const deadline = Date.now() + 5000;
+                while (replies.length === 0 && !closed && Date.now() < deadline)
+                    await new Promise<void>((r) =>
+                    {
+                        wake = r;
+                        setTimeout(r, 100);
+                    });
+                return replies.shift();
+            };
+            const id = RRNodeID.newUniqueID();
+            try
+            {
+                const cc = new rri.Message();
+                cc.header.senderNodeID = id;
+                const e = new rri.MessageEntry(rri.MessageEntryType.StreamOp, "CreateConnection");
+                e.addElement(new rri.MessageElement("capabilities", rri.DataTypes.uint32_t, Uint32Array.of((rri.TransportCapabilityCode.Message2BasicPage | rri.TransportCapabilityCode.Message2BasicEnable) >>> 0)));
+                cc.entries.push(e);
+                s.write(rri.serializeMessage(cc));
+                const cc_ret = await next();
+                assert.equal(cc_ret?.entries[0]!.error, rri.MessageErrorType.None);
+
+                const m = new rri.Message();
+                m.header.senderNodeID = id;
+                m.header.receiverNodeID = server.nodeID;
+                m.header.senderEndpoint = 1234;
+                for (let i = 0; i < count; i++)
+                {
+                    const g = new rri.MessageEntry(rri.MessageEntryType.GetServiceDesc, "");
+                    g.servicePath = "test";
+                    g.requestID = i + 1;
+                    m.entries.push(g);
+                }
+                s.write(rri.serializeMessage(m));
+                const ret = await next();
+                return { ret, closed };
+            }
+            finally
+            {
+                s.destroy();
+            }
+        };
+
+        const one = await run(1);
+        assert.equal(one.ret?.entries.length, 1);
+        assert.equal(one.ret?.entries[0]!.entryType, rri.MessageEntryType.GetServiceDescRet);
+        assert.equal(one.ret?.entries[0]!.error, rri.MessageErrorType.None);
+        assert.equal(one.closed, false);
+
+        const two = await run(2);
+        assert.equal(two.ret, undefined);
+        assert.equal(two.closed, true);
+    });
+
+    test("malformed pipe packet acknowledgements are ignored and do not stop the service", async () =>
+    {
+        // A void element used to throw outside any catch, and the unhandled rejection stopped the Node process
+        const s = netConnect(tcp.listenPort, "127.0.0.1");
+        s.on("error", () => undefined);
+        await new Promise((r) => s.once("connect", r));
+        const replies: Message[] = [];
+        let pending = Buffer.alloc(0);
+        let wake = () => {};
+        s.on("data", (d: Buffer) =>
+        {
+            pending = Buffer.concat([pending, d]);
+            while (pending.length >= 8 && pending.length >= pending.readUInt32LE(4))
+            {
+                const n = pending.readUInt32LE(4);
+                replies.push(deserializeMessage(new Uint8Array(pending.subarray(0, n))));
+                pending = pending.subarray(n);
+            }
+            wake();
+        });
+        const request = async (m: Message) =>
+        {
+            s.write(serializeMessage(m));
+            while (replies.length === 0) await new Promise<void>((r) => (wake = r));
+            return replies.shift()!;
+        };
+        const id = NodeID.newUniqueID();
+        let remote = 0;
+        const message = (e: MessageEntry) =>
+        {
+            const m = new Message();
+            m.header.senderNodeID = id;
+            m.header.receiverNodeID = server.nodeID;
+            m.header.senderEndpoint = 4321;
+            m.header.receiverEndpoint = remote;
+            e.servicePath = "test";
+            e.requestID = 1;
+            m.entries.push(e);
+            return m;
+        };
+        try
+        {
+            const cc = new Message();
+            cc.header.senderNodeID = id;
+            const e = new MessageEntry(MessageEntryType.StreamOp, "CreateConnection");
+            e.addElement(new MessageElement("capabilities", DataTypes.uint32_t, Uint32Array.of((TransportCapabilityCode.Message2BasicPage | TransportCapabilityCode.Message2BasicEnable) >>> 0)));
+            cc.entries.push(e);
+            assert.equal((await request(cc)).entries[0]!.error, MessageErrorType.None);
+
+            const connected = await request(message(new MessageEntry(MessageEntryType.ConnectClient, "")));
+            assert.equal(connected.entries[0]!.error, MessageErrorType.None);
+            remote = connected.header.senderEndpoint;
+
+            const before_endpoints = new Set(obj.pp!.activeEndpoints);
+            const pc = new MessageEntry(MessageEntryType.PipeConnectReq, "pp");
+            pc.addElement(new MessageElement("index", DataTypes.int32_t, Int32Array.of(-1)));
+            const pr = await request(message(pc));
+            assert.equal(pr.entries[0]!.error, MessageErrorType.None);
+            const index = (pr.entries[0]!.elements[0]!.data as Int32Array)[0]!;
+            const p = obj.pp!.activeEndpoints.find((x) => !before_endpoints.has(x))!;
+            const acks: number[] = [];
+            p.packetAckReceivedEvent.addHandler((_p, n) => acks.push(n));
+
+            const ack = new MessageEntry(MessageEntryType.PipePacketRet, "pp");
+            ack.addElement(new MessageElement(String(index), DataTypes.void_t, null));
+            ack.addElement(new MessageElement(String(index), DataTypes.uint32_t, new Uint32Array(0)));
+            ack.addElement(new MessageElement(String(index), DataTypes.string_t, "x"));
+            ack.addElement(new MessageElement(String(index), DataTypes.uint32_t, Uint32Array.of(7)));
+            s.write(serializeMessage(message(ack)));
+
+            // The service still answers, and only the well formed acknowledgement was delivered
+            const alive = await request(message(new MessageEntry(MessageEntryType.ClientKeepAliveReq, "")));
+            assert.equal(alive.entries[0]!.entryType, MessageEntryType.ClientKeepAliveRet);
+            assert.deepEqual(acks, [7]);
+        }
+        finally
+        {
+            s.destroy();
+        }
     });
 
     test("Core's Python client uses the service", { timeout: 60000 }, async () =>

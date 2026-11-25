@@ -212,6 +212,8 @@ export class NodeDiscovery
         await this.transport.enableNodeDiscoveryListening((a) => this.nodeAnnounced(a), this.flags);
         // The node's service index reports these, as Core's does
         setDetectedNodesSource(this.node, () => this.detectedNodes.map((n) => ({ nodeID: n.nodeID, nodeName: n.nodeName, urls: n.urls.map((u) => u.url) })));
+        // start() may be called again; do not leave the previous timer running
+        clearInterval(this.cleanup_timer);
         this.cleanup_timer = setInterval(() => this.cleanNodes(), Math.min(5000, this.node_expiration));
         this.cleanup_timer.unref();
         this.started = true;
@@ -274,6 +276,8 @@ export class NodeDiscovery
 
     private nodeAnnounced(a: NodeAnnouncement): void
     {
+        // The node's own announcements loop back to it. Core ignores them
+        if (a.nodeID.equals(this.node.nodeID)) return;
         const key = a.nodeID.toString();
         const now = Date.now();
         const storage = this.nodes.get(key);

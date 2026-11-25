@@ -27,7 +27,6 @@ import { ServerStreamConnection } from "./StreamConnections.js";
 /** The port of the Robot Raconteur port sharer, which a service must not listen on */
 const PORT_SHARER_PORT = 48653;
 
-/** Origins that may connect with a WebSocket, the defaults of Core */
 /**
  * The host and port of the local end of an accepted socket, as Core reports it to the service
  * index, with IPv6 addresses in brackets without a scope
@@ -42,16 +41,13 @@ export function urlHost(socket: { localAddress?: string; localPort?: number }): 
 
 /**
  * The origins Core allows to connect with a WebSocket by default: pages loaded from files, and
- * robotraconteur.com. A scheme on its own, such as "https://", allows every origin with it.
+ * https robotraconteur.com. A scheme on its own, such as "https://", allows every origin with it.
+ * Browsers send "null" for pages loaded from local files, and also for sandboxed iframes and data:
+ * pages; remove it from webSocketAllowedOrigins if local files are not needed.
  */
 export const DEFAULT_WEBSOCKET_ALLOWED_ORIGINS: readonly string[] = [
     "null",
     "file://",
-    "chrome-extension://",
-    "http://robotraconteur.com",
-    "http://robotraconteur.com:80",
-    "http://*.robotraconteur.com",
-    "http://*.robotraconteur.com:80",
     "https://robotraconteur.com",
     "https://robotraconteur.com:443",
     "https://*.robotraconteur.com",
@@ -129,10 +125,10 @@ export class TcpServer
         return this.port;
     }
 
-    /** Listen on all addresses, or only on loopback. Port 0 picks a free port */
     /** Set if the server only accepts connections from this computer */
     localhostOnly = false;
 
+    /** Listen on all addresses, or only on loopback. Port 0 picks a free port */
     async start(port: number, localhost_only: boolean): Promise<void>
     {
         this.localhostOnly = localhost_only;
@@ -265,7 +261,7 @@ export class TcpServer
                     res.writeHead(404);
                     res.end();
                 });
-                this.http.on("upgrade", (req: IncomingMessage, s: Duplex, h: Buffer) => void this.parent.serveUpgrade(req, s, h, false));
+                this.http.on("upgrade", (req: IncomingMessage, s: Duplex, h: Buffer) => void this.parent.serveUpgrade(req, s, h, false).catch(() => s.destroy()));
                 this.http.on("clientError", (_e, s: Duplex) => s.destroy());
             }
             socket.unshift(head);
@@ -278,7 +274,7 @@ export class TcpServer
         }
     }
 
-    /** Check the request as Core does, then accept the WebSocket */
+    /** Stop listening for connections */
     close(): void
     {
         for (const s of this.servers) s.close();

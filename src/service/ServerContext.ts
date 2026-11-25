@@ -39,6 +39,18 @@ export function decodeServicePathIndex(index: string): string
     }
 }
 
+/** Encode an objref index for a service path as Core's encode_index does (lowercase %xx for all but letters and digits) */
+function encodeServicePathIndex(index: string): string
+{
+    let out = "";
+    for (const b of new TextEncoder().encode(index))
+    {
+        const c = String.fromCharCode(b);
+        out += /[a-zA-Z0-9]/.test(c) ? c : "%" + b.toString(16).padStart(2, "0");
+    }
+    return out;
+}
+
 /** The segments of a service path, each a name with an optional objref index */
 export function parseServicePath(path: string): { name: string; index?: string }[]
 {
@@ -102,7 +114,8 @@ export class ServerEndpoint implements Endpoint
             this.trySend([r]);
             return;
         }
-        ServerEndpoint.current_storage.run(this, () => void this.context.messageReceived(m, this));
+        // Nothing awaits this, so an error must not become an unhandled rejection, which stops Node
+        ServerEndpoint.current_storage.run(this, () => void this.context.messageReceived(m, this).catch((err: unknown) => console.error("Error processing message from client:", err)));
     }
 
     transportConnectionClosed(): void
@@ -399,11 +412,12 @@ export class ServerContext
 
         let skel = this.skels.get(this.serviceName)!;
         let current = this.serviceName;
-        const parts = path.split(".");
         for (let i = 1; i < segments.length; i++)
         {
             const parent = skel;
-            current = current + "." + parts[i]!;
+            // Key skels by the canonical spelling of the path, so obj[1] and obj[%31] are one skel (one lock)
+            const seg_i = segments[i]!;
+            current = current + "." + seg_i.name + (seg_i.index === undefined ? "" : `[${encodeServicePathIndex(seg_i.index)}]`);
             const known = this.skels.get(current);
             if (known)
             {
@@ -446,12 +460,12 @@ export class ServerContext
     private releaseClientLocks(ep: ServerEndpoint): void
     {
         const username = ep.authenticatedUser?.username;
-        if (username === undefined) return;
-        const last = ![...this.clients.values()].some((c) => c.authenticatedUser?.username === username);
+        const last = username !== undefined && ![...this.clients.values()].some((c) => c.authenticatedUser?.username === username);
         for (const [path, lock] of [...this.object_locks])
         {
-            if (lock.username !== username) continue;
-            if (lock.endpoint === ep.localEndpoint || (lock.endpoint === 0 && last))
+            // Client locks of this endpoint go whatever user it is logged in as now (it may have logged
+            // out or in again); user locks when the user's last client leaves
+            if (lock.endpoint === ep.localEndpoint || (lock.endpoint === 0 && lock.username === username && last))
             {
                 lock.release();
                 this.object_locks.delete(path);
@@ -606,7 +620,8 @@ export class ServerContext
         if (!lock) return;
         if (lock.rootPath !== path) throw objectLockedError("Cannot release inherited lock");
         if (username !== lock.username && !override) throw objectLockedError("Service locked by user " + lock.username);
-        if (lock.endpoint !== 0 && endpoint !== lock.endpoint && username !== lock.username && !override) throw objectLockedError("Service locked by other session");
+        // A client lock may only be released by its own client (endpoint 0: the service itself)
+        if (lock.endpoint !== 0 && endpoint !== 0 && endpoint !== lock.endpoint && !override) throw objectLockedError("Service locked by other session");
         lock.release();
         this.object_locks.delete(path);
     }
@@ -624,6 +639,9 @@ export class ServerContext
         const path = m.servicePath;
         if (m.memberName.startsWith("Monitor"))
         {
+            // Monitor operations must not bypass requirevaliduser (reachable after a legacy ConnectClient,
+            // which creates the endpoint before authentication)
+            this.checkAuthenticated(ep);
             const skel = await this.getObjectSkel(path);
             const endpoint = ep.localEndpoint;
             if (m.memberName === "MonitorEnter") ret(await skel.monitor.enter(endpoint, (getElement(m.elements, "timeout").data as Int32Array)[0]!));
@@ -637,6 +655,10 @@ export class ServerContext
             return r;
         }
 
+        if ((m.memberName === "RequestObjectLock" || m.memberName === "RequestClientObjectLock") && !this.allowObjectLock)
+        {
+            throw serviceError(MessageErrorType.PermissionDenied, "PermissionDenied", "Object locking is not enabled for this service");
+        }
         const user = ep.authenticatedUser;
         if (!user) throw serviceError(MessageErrorType.PermissionDenied, "PermissionDenied", "User must be authenticated to lock object");
         if (!user.privileges.includes("objectlock") && !user.privileges.includes("objectlockoverride")) throw objectLockedError("User does not have object locking privileges");
@@ -719,7 +741,10 @@ export class ServerContext
     /** Send an entry to every connected client, or to those listed */
     sendEvent(e: MessageEntry, endpoints?: number[]): void
     {
-        const targets = endpoints ? endpoints.map((n) => this.clients.get(n)).filter((x) => x !== undefined) : [...this.clients.values()];
+        // As in Core, clients that have not logged in to a service that requires it are skipped
+        const targets = endpoints
+            ? endpoints.map((n) => this.clients.get(n)).filter((x) => x !== undefined)
+            : [...this.clients.values()].filter((c) => !this.requireValidUser || c.authenticatedUser !== null);
         for (const c of targets) c.trySend([e]);
     }
 

@@ -23,6 +23,8 @@ import type { ServiceSkel } from "./ServiceSkel.js";
 import { callHandler, directionOf, memberError, Waiters } from "./Wire.js";
 
 const MAX_PACKET_NUMBER = 0xffffffff;
+/** How far ahead of the next expected packet number a reliable pipe holds packets that arrive out of order */
+const MAX_OUT_OF_ORDER_PACKETS = 1024;
 
 /** A packet from tryReceivePacketWait, which returns null instead of throwing */
 export interface PipePacketOf<T>
@@ -185,7 +187,9 @@ export class PipeServer<T = unknown>
     {
         for (const el of e.elements)
         {
-            this.endpoints.get(key(ep.localEndpoint, Number(el.elementName)))?.ackReceived((el.data as Uint32Array)[0]!);
+            // The packet number is a uint32, as Core checks. Skip malformed elements
+            if (el.elementType !== DataTypes.uint32_t || !(el.data instanceof Uint32Array) || el.data.length < 1) continue;
+            this.endpoints.get(key(ep.localEndpoint, Number(el.elementName)))?.ackReceived(el.data[0]!);
         }
     }
 
@@ -365,6 +369,10 @@ export class PipeEndpoint<T = unknown>
         }
         else
         {
+            // Only queue packets a bounded distance ahead of the next expected one, as Core. Old or
+            // duplicate numbers and far-future numbers would never be delivered or freed
+            const ahead = (number - this.recv_number) >>> 0;
+            if (ahead === 0 || ahead > MAX_OUT_OF_ORDER_PACKETS) return;
             this.out_of_order.set(number, value);
             return;
         }

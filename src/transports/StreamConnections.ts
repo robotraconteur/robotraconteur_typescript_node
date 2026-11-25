@@ -221,6 +221,13 @@ export class ServerStreamConnection extends StreamConnection implements ServerTr
     protected override routeMessage(m: Message): void
     {
         if (isSpecialRequest(m)) void this.processSpecialRequest(m);
+        else if (![...this.endpoints].some((e) => e.localEndpoint === m.header.receiverEndpoint))
+        {
+            // Only the service endpoints of clients connected over this connection may be addressed, so a
+            // connection cannot use another client's session
+            const r = errorReturnMessage(m, MessageErrorType.InvalidEndpoint, "RobotRaconteur.InvalidEndpoint", "Invalid destination endpoint");
+            if (r.entries.length > 0) this.sendMessage(r);
+        }
         else super.routeMessage(m);
     }
 
@@ -281,7 +288,6 @@ export class ServerStreamConnection extends StreamConnection implements ServerTr
         }
     }
 
-    /** Accept CreateConnection for this node, agreeing on the capabilities both sides support, as Core does */
     /**
      * Answer STARTTLS and switch to TLS, as Core does. The reply is written before the switch, and
      * the TLS socket takes the incoming data from then on. Returns true once the reply is sent
@@ -312,13 +318,16 @@ export class ServerStreamConnection extends StreamConnection implements ServerTr
         return true;
     }
 
+    /** Accept CreateConnection for this node, agreeing on the capabilities both sides support, as Core does */
     private createConnectionForClient(m: Message, ret: MessageEntry): void
     {
         if (this.requireTls && !this.secure) throw connectionError("Service requires TLS");
         const node = this.parent.node;
         const h = m.header;
         const for_node = h.receiverNodeID.isAnyNode || h.receiverNodeID.equals(node.nodeID);
-        if (!for_node || (h.receiverNodeName !== "" && h.receiverNodeName !== node.nodeName))
+        // As in Core, a connection that was created keeps the NodeID of its client
+        const same_client = this.remoteNodeID.isAnyNode || this.remoteNodeID.equals(h.senderNodeID);
+        if (!for_node || !same_client || (h.receiverNodeName !== "" && h.receiverNodeName !== node.nodeName))
         {
             throw new RobotRaconteurError(MessageErrorType.NodeNotFound, "RobotRaconteur.NodeNotFound", "Node not found");
         }
@@ -326,7 +335,8 @@ export class ServerStreamConnection extends StreamConnection implements ServerTr
         const caps = findElement(m.entries[0]!.elements, "capabilities")?.data;
         if (caps instanceof Uint32Array)
         {
-            let message2 = 0;
+            // As in Core, Message Version 2 is assumed unless the client sends a page for it
+            let message2: number = TransportCapabilityCode.Message2BasicEnable;
             for (const cap of caps)
             {
                 if (((cap & TransportCapabilityCode.PageMask) >>> 0) === TransportCapabilityCode.Message2BasicPage)
